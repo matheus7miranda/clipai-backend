@@ -2,111 +2,128 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import openai
+import httpx
 import jwt
 import time
-import httpx
 import os
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['*'],
-    allow_methods=['*'],
-    allow_headers=['*'],
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-openai.api_key = os.environ.get('OPENAI_API_KEY')
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
 KLING_ACCESS_KEY = os.environ.get('KLING_ACCESS_KEY')
 KLING_SECRET_KEY = os.environ.get('KLING_SECRET_KEY')
 
-
-def generate_kling_token():
-    payload = {
-        'iss': KLING_ACCESS_KEY,
-        'exp': int(time.time()) + 1800,
-        'nbf': int(time.time()) - 5
-    }
-    return jwt.encode(payload, KLING_SECRET_KEY, algorithm='HS256')
+openai.api_key = OPENAI_API_KEY
 
 
 class ScriptRequest(BaseModel):
     topic: str
+    style: str = "cinematic"
     duration: int = 30
 
 
 class VideoRequest(BaseModel):
     prompt: str
     duration: int = 5
-    aspect_ratio: str = '16:9'
 
 
-class TaskRequest(BaseModel):
-    task_id: str
+def generate_kling_token():
+    payload = {
+        "iss": KLING_ACCESS_KEY,
+        "exp": int(time.time()) + 1800,
+        "nbf": int(time.time()) - 5
+    }
+    token = jwt.encode(payload, KLING_SECRET_KEY, algorithm="HS256")
+    return token
 
 
-@app.post('/api/generate-script')
-async def generate_script(req: ScriptRequest):
+@app.get("/")
+def root():
+    return {"status": "ClipAI backend online"}
+
+
+@app.post("/generate-script")
+async def generate_script(request: ScriptRequest):
     try:
-        response = openai.chat.completions.create(
-            model='gpt-4o',
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        response = client.chat.completions.create(
+            model="gpt-4",
             messages=[
-                {'role': 'system', 'content': 'Voce e um roteirista criativo.'},
-                {'role': 'user', 'content': f'Crie um roteiro de {req.duration} segundos sobre: {req.topic}.'}
+                {
+                    "role": "system",
+                    "content": "You are a professional video script writer. Create engaging, concise scripts for short videos."
+                },
+                {
+                    "role": "user",
+                    "content": f"Write a {request.duration}-second {request.style} video script about: {request.topic}. Format it as a list of scenes with descriptions."
+                }
             ]
         )
-        return {'script': response.choices[0].message.content}
+        script = response.choices[0].message.content
+        return {"script": script, "topic": request.topic}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post('/api/generate-video')
-async def generate_video(req: VideoRequest):
-    token = generate_kling_token()
-    headers = {
-        'Authorization': f'Bearer {token}',
-        'Content-Type': 'application/json'
-    }
-    payload = {
-        'model_name': 'kling-v1',
-        'prompt': req.prompt,
-        'duration': str(req.duration),
-        'aspect_ratio': req.aspect_ratio
-    }
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            'https://api.klingai.com/v1/videos/text2video',
-            json=payload,
-            headers=headers,
-            timeout=30
-        )
-    if response.status_code != 200:
-        raise HTTPException(status_code=response.status_code, detail=response.text)
-    data = response.json()
-    return {'task_id': data['data']['task_id']}
+@app.post("/generate-video")
+async def generate_video(request: VideoRequest):
+    try:
+        token = generate_kling_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model_name": "kling-v1",
+            "prompt": request.prompt,
+            "mode": "std",
+            "duration": str(request.duration)
+        }
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                "https://api.klingai.com/v1/videos/text2video",
+                json=payload,
+                headers=headers
+            )
+            if response.status_code != 200:
+                raise HTTPException(status_code=response.status_code, detail=response.text)
+            data = response.json()
+            task_id = data.get("data", {}).get("task_id")
+            return {"task_id": task_id, "status": "processing"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post('/api/video-status')
-async def video_status(req: TaskRequest):
-    token = generate_kling_token()
-    headers = {'Authorization': f'Bearer {token}'}
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f'https://api.klingai.com/v1/videos/text2video/{req.task_id}',
-            headers=headers,
-            timeout=30
-        )
-    if response.status_code != 200:
-        raise HTTPException(status_code=response.status_code, detail=response.text)
-    data = response.json()
-    task = data['data']
-    status = task['task_status']
-    result = {'status': status, 'task_id': req.task_id}
-    if status == 'succeed':
-        result['video_url'] = task['task_result']['videos'][0]['url']
-    return result
-
-
-@app.get('/')
-def root():
-    return {'status': 'ClipAI rodando!'}
+@app.get("/video-status/{task_id}")
+async def get_video_status(task_id: str):
+    try:
+        token = generate_kling_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"https://api.klingai.com/v1/videos/text2video/{task_id}",
+                headers=headers
+            )
+            if response.status_code != 200:
+                raise HTTPException(status_code=response.status_code, detail=response.text)
+            data = response.json()
+            task_status = data.get("data", {}).get("task_status")
+            videos = data.get("data", {}).get("task_result", {}).get("videos", [])
+            video_url = videos[0].get("url") if videos else None
+            return {
+                "task_id": task_id,
+                "status": task_status,
+                "video_url": video_url
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

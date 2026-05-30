@@ -2,11 +2,11 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import subprocess
-import tempfile
 import os
 import uuid
 import shutil
-import json
+import re
+import imageio_ffmpeg
 
 app = FastAPI()
 
@@ -17,6 +17,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Binario do ffmpeg embarcado via pip (nao depende do sistema)
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+
 # Diretorio publico onde os frames/clipes ficam acessiveis
 WORK_DIR = "/tmp/clipai"
 os.makedirs(WORK_DIR, exist_ok=True)
@@ -26,20 +29,21 @@ CLIP_SECONDS = 8
 
 def run(cmd):
     result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr)
-    return result.stdout
+    return result
 
 def get_duration(path):
-    out = run([
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", path
-    ])
-    return float(out.strip())
+    # Usa o proprio ffmpeg para descobrir a duracao (sem ffprobe)
+    result = subprocess.run([FFMPEG, "-i", path], capture_output=True, text=True)
+    output = result.stderr
+    match = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", output)
+    if not match:
+        raise RuntimeError("Nao foi possivel ler a duracao do video. Saida: " + output[-500:])
+    h, m, s = match.groups()
+    return int(h) * 3600 + int(m) * 60 + float(s)
 
 @app.get("/")
 def root():
-    return {"status": "ClipAI backend online", "version": "2.0"}
+    return {"status": "ClipAI backend online", "version": "2.1", "ffmpeg": FFMPEG}
 
 @app.post("/process-video")
 async def process_video(video: UploadFile = File(...), avatar: UploadFile = File(None)):
@@ -78,24 +82,15 @@ async def process_video(video: UploadFile = File(...), avatar: UploadFile = File
             audio_path = os.path.join(job_dir, audio_name)
 
             # Corta o clipe
-            run([
-                "ffmpeg", "-y", "-ss", str(start), "-i", video_path,
-                "-t", str(dur), "-c", "copy", clip_path
-            ])
+            run([FFMPEG, "-y", "-ss", str(start), "-i", video_path,
+                 "-t", str(dur), "-c", "copy", clip_path])
             # Extrai um frame do meio do clipe
-            run([
-                "ffmpeg", "-y", "-ss", str(start + dur / 2), "-i", video_path,
-                "-frames:v", "1", "-q:v", "2", frame_path
-            ])
-            # Extrai o audio do clipe (pode falhar se nao houver audio)
-            has_audio = True
-            try:
-                run([
-                    "ffmpeg", "-y", "-ss", str(start), "-i", video_path,
-                    "-t", str(dur), "-vn", "-q:a", "2", audio_path
-                ])
-            except Exception:
-                has_audio = False
+            run([FFMPEG, "-y", "-ss", str(start + dur / 2), "-i", video_path,
+                 "-frames:v", "1", "-q:v", "2", frame_path])
+            # Extrai o audio do clipe
+            audio_res = run([FFMPEG, "-y", "-ss", str(start), "-i", video_path,
+                             "-t", str(dur), "-vn", "-q:a", "2", audio_path])
+            has_audio = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
 
             base = f"/files/{job_id}"
             clips.append({

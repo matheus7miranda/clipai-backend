@@ -1,11 +1,12 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import openai
-import httpx
-import jwt
-import time
+from fastapi.staticfiles import StaticFiles
+import subprocess
+import tempfile
 import os
+import uuid
+import shutil
+import json
 
 app = FastAPI()
 
@@ -16,114 +17,105 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
-KLING_ACCESS_KEY = os.environ.get('KLING_ACCESS_KEY')
-KLING_SECRET_KEY = os.environ.get('KLING_SECRET_KEY')
+# Diretorio publico onde os frames/clipes ficam acessiveis
+WORK_DIR = "/tmp/clipai"
+os.makedirs(WORK_DIR, exist_ok=True)
+app.mount("/files", StaticFiles(directory=WORK_DIR), name="files")
 
-openai.api_key = OPENAI_API_KEY
+CLIP_SECONDS = 8
 
+def run(cmd):
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr)
+    return result.stdout
 
-class ScriptRequest(BaseModel):
-    topic: str
-    style: str = "cinematic"
-    duration: int = 30
-
-
-class VideoRequest(BaseModel):
-    prompt: str
-    duration: int = 5
-
-
-def generate_kling_token():
-    payload = {
-        "iss": KLING_ACCESS_KEY,
-        "exp": int(time.time()) + 1800,
-        "nbf": int(time.time()) - 5
-    }
-    token = jwt.encode(payload, KLING_SECRET_KEY, algorithm="HS256")
-    return token
-
+def get_duration(path):
+    out = run([
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", path
+    ])
+    return float(out.strip())
 
 @app.get("/")
 def root():
-    return {"status": "ClipAI backend online"}
+    return {"status": "ClipAI backend online", "version": "2.0"}
 
+@app.post("/process-video")
+async def process_video(video: UploadFile = File(...), avatar: UploadFile = File(None)):
+    job_id = str(uuid.uuid4())[:8]
+    job_dir = os.path.join(WORK_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
 
-@app.post("/generate-script")
-async def generate_script(request: ScriptRequest):
     try:
-        client = openai.OpenAI(api_key=OPENAI_API_KEY)
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a professional video script writer. Create engaging, concise scripts for short videos."
-                },
-                {
-                    "role": "user",
-                    "content": f"Write a {request.duration}-second {request.style} video script about: {request.topic}. Format it as a list of scenes with descriptions."
-                }
-            ]
-        )
-        script = response.choices[0].message.content
-        return {"script": script, "topic": request.topic}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Salva o video enviado
+        video_path = os.path.join(job_dir, "source.mp4")
+        with open(video_path, "wb") as f:
+            shutil.copyfileobj(video.file, f)
 
+        # Salva o avatar se enviado
+        avatar_name = None
+        if avatar is not None:
+            avatar_name = "avatar_" + (avatar.filename or "avatar.png")
+            avatar_path = os.path.join(job_dir, avatar_name)
+            with open(avatar_path, "wb") as f:
+                shutil.copyfileobj(avatar.file, f)
 
-@app.post("/generate-video")
-async def generate_video(request: VideoRequest):
-    try:
-        token = generate_kling_token()
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
+        total = get_duration(video_path)
+        clips = []
+        index = 0
+        start = 0.0
+        while start < total:
+            dur = min(CLIP_SECONDS, total - start)
+            if dur < 1.0:
+                break
+            index += 1
+            clip_name = f"clip_{index}.mp4"
+            frame_name = f"frame_{index}.jpg"
+            audio_name = f"audio_{index}.mp3"
+            clip_path = os.path.join(job_dir, clip_name)
+            frame_path = os.path.join(job_dir, frame_name)
+            audio_path = os.path.join(job_dir, audio_name)
+
+            # Corta o clipe
+            run([
+                "ffmpeg", "-y", "-ss", str(start), "-i", video_path,
+                "-t", str(dur), "-c", "copy", clip_path
+            ])
+            # Extrai um frame do meio do clipe
+            run([
+                "ffmpeg", "-y", "-ss", str(start + dur / 2), "-i", video_path,
+                "-frames:v", "1", "-q:v", "2", frame_path
+            ])
+            # Extrai o audio do clipe (pode falhar se nao houver audio)
+            has_audio = True
+            try:
+                run([
+                    "ffmpeg", "-y", "-ss", str(start), "-i", video_path,
+                    "-t", str(dur), "-vn", "-q:a", "2", audio_path
+                ])
+            except Exception:
+                has_audio = False
+
+            base = f"/files/{job_id}"
+            clips.append({
+                "index": index,
+                "start": round(start, 2),
+                "end": round(start + dur, 2),
+                "duration": round(dur, 2),
+                "clip_url": f"{base}/{clip_name}",
+                "frame_url": f"{base}/{frame_name}",
+                "audio_url": f"{base}/{audio_name}" if has_audio else None,
+            })
+            start += CLIP_SECONDS
+
+        return {
+            "job_id": job_id,
+            "total_duration": round(total, 2),
+            "clip_seconds": CLIP_SECONDS,
+            "num_clips": len(clips),
+            "avatar": (f"/files/{job_id}/{avatar_name}" if avatar_name else None),
+            "clips": clips,
         }
-        payload = {
-            "model_name": "kling-v1",
-            "prompt": request.prompt,
-            "mode": "std",
-            "duration": str(request.duration)
-        }
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                "https://api.klingai.com/v1/videos/text2video",
-                json=payload,
-                headers=headers
-            )
-            if response.status_code != 200:
-                raise HTTPException(status_code=response.status_code, detail=response.text)
-            data = response.json()
-            task_id = data.get("data", {}).get("task_id")
-            return {"task_id": task_id, "status": "processing"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/video-status/{task_id}")
-async def get_video_status(task_id: str):
-    try:
-        token = generate_kling_token()
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                f"https://api.klingai.com/v1/videos/text2video/{task_id}",
-                headers=headers
-            )
-            if response.status_code != 200:
-                raise HTTPException(status_code=response.status_code, detail=response.text)
-            data = response.json()
-            task_status = data.get("data", {}).get("task_status")
-            videos = data.get("data", {}).get("task_result", {}).get("videos", [])
-            video_url = videos[0].get("url") if videos else None
-            return {
-                "task_id": task_id,
-                "status": task_status,
-                "video_url": video_url
-            }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
